@@ -6,6 +6,7 @@ volatile bool ready_apps = 0;
 const char startPkg[15] = "0 210214301131";
 uint8_t rx_buffer[64];
 volatile uint8_t rx_index = 0;
+uint32_t startSendingPkg = 0x67F0F670;
 
 void USART1_IRQHandler(void) {
     if (USART1->SR & USART_SR_RXNE) {

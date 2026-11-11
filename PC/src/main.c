@@ -1,22 +1,31 @@
 #include "../inc/main.h"
-#include <string.h>
 
 const char startpkg[15] = "0 210214301131";
 char apps[3][10];
 volatile uint8_t res = 0;
-const uint32_t startSendingPkg = 0x067F0F67;
+volatile uint16_t ADC_value = 0x0;
+const uint32_t startSendingPkg = 0x67F0F670;
 const char* LOGOPATH = ".logos/";
 
-void write_log(const char* msg) {
+void log_error(const char* msg) {
     const char* HOMEDIR = getenv("HOME");
-    char path_to_log[64];
-    strcat(path_to_log, HOMEDIR); strcat(path_to_log, ".logs/AppMix.log");
-    FILE* file = fopen(path_to_log, "wb");
-    // rewrite
-    printf("%s", msg);
+    char path_to_log[256];
+    snprintf(path_to_log, sizeof(path_to_log), "%s/.logs/AppMix.log", HOMEDIR);
+    
+    FILE* file = fopen(path_to_log, "a");
+    if (file != NULL) {
+        fprintf(file, "%s\n", msg);
+        fclose(file);
+    } else {
+        printf("Не удалось открыть лог-файл!\n");
+    }
 }
 
-_Bool init_apps() {
+void render_error(const char* error) {
+    // logic of out to DE notify
+}
+
+bool init_apps() {
     char tmp_res = res;
     int count;
 
@@ -34,7 +43,7 @@ _Bool init_apps() {
         fgets(buffer, sizeof(buffer), pipe);
         for (int i = 0; i < 5; i++) {
             if (buffer[i] == '0') {
-                continue;
+                res &= ~(1 << i);
             } else if (buffer[i] == '1') {
                 res |= (1 << i);
             }
@@ -47,66 +56,120 @@ _Bool init_apps() {
     return 1;
 }
 
-void send_logos(int* fd, const char* HOMEDIR) {     // sending logos to MC
-    FILE* file; // fd for file
-    int byte;   // byte which we take from 
-    while (5) {
-        char path_to_logo[64];
-        strcat(path_to_logo, HOMEDIR); strcat(path_to_logo, "./logo/");
-        file = fopen(path_to_logo, "wb");   // open fd to current file of logo
-        byte = 0;   // cant use unsigned types cause of EOF = -1 = 255
+void send_id_logos(int* fd) {
+    char pkg[8];
+    memset(pkg, 0, 8);
+    
+    if (res & (1 << 7)) pkg[0] = '1'; else pkg[0] = '0';
+    if (res & (1 << 6)) pkg[1] = '1'; else pkg[1] = '0';
+    if (res & (1 << 5)) pkg[2] = '1'; else pkg[2] = '0';
+    if (res & (1 << 4)) pkg[3] = '1'; else pkg[3] = '0';
+    if (res & (1 << 3)) pkg[4] = '1'; else pkg[4] = '0';
+    if (res & (1 << 2)) pkg[5] = '1'; else pkg[5] = '0';
+    if (res & (0x1))    pkg[6] = '1'; else pkg[6] = '0';
+    
+    pkg[7] = '\\';
 
-        write(*fd, &startSendingPkg, 4);    // says that its gonna send logos to MC
-        while ((byte = fgetc(file)) != EOF) {   // check for end of file
-            write(*fd, &byte, 1);           // sending all logos to MC
-        }
-    }
-    pclose(file);                           // close FD
+    write(*fd, pkg, 8);
 }
 
-_Bool main_cycle_monitoring(int* fd, char* buff, const char* HOMEDIR) { // main cycle
-    while (*fd < 0) {
-        // trying to open the port
-        *fd = open("/dev/ttyUSB0", O_NOCTTY | O_RDONLY);
-        
-        if (*fd < 0) {
-            // mini delay
+void Handler_for_processes(int* fd) {
+    pid_t pid = fork();
+
+    if (pid == 0) {
+        char tmp_buff[7];
+
+        while (1) {
+            memset(tmp_buff, 0, 7);
+            
+            uint8_t readed = 0;
+            char tmp_byte = 0x0;
+
+            while (tmp_byte != '\\' && readed < 7) {
+                int n = read(*fd, &tmp_byte, 1);
+
+                if (n == 1) {
+                    tmp_buff[readed++] = tmp_byte;
+                } else if (n < 0) {
+                    break;
+                }
+            }
+            
+            tmp_buff[readed] = '\0';
+
+            if (*tmp_buff == '1') {
+                char* tmp_ptr = tmp_buff + 2;
+                char tmp_int_buff[6]; memset(tmp_int_buff, 0, 6);
+                uint8_t tmp_it = 0;
+                
+                while (*tmp_ptr != '\\' && *tmp_ptr != '\0') {
+                    if (tmp_it >= 5)  {
+                        log_error("MC is sending wrong ADC value!");
+                        break;
+                    }
+                    tmp_int_buff[tmp_it++] = *tmp_ptr++;
+                }
+                tmp_int_buff[tmp_it] = '\0';
+                
+                ADC_value = atoi(tmp_int_buff);
+            }
+
+            usleep(5000);
+        }
+        return;
+    } else {
+        while (1) {
+            if (init_apps()) {
+                send_id_logos(fd);
+            }
             sleep(1);
         }
+        return;
+    }
+}
+
+bool main_cycle_monitoring(int* fd, char* tmp_buff) { // main cycle
+    *fd = open("/dev/ttyUSB0", O_NOCTTY | O_RDWR);
+    while (*fd < 0) {
+        sleep(1);
+        // trying to open the port
+        *fd = open("/dev/ttyUSB0", O_NOCTTY | O_RDWR);
     }
     
     // MC was finnaly connected
 
-    while(1) {
-        memset(buff, 0, 64);
-        read(*fd, buff, 64);    // reading msgs from MC
-        if (!strcmp(buff, startpkg)) {  // if its not gonna be the start package we gonna close the MC FD and write log about that
-            close(*fd);
-            return 0;
+    memset(tmp_buff, 0, 64);
+    uint8_t readed = 0;
+    char tmp_byte = 0x0;
+
+    while (tmp_byte != '\\' && readed < 15) {    // waiting for all bytes cause of UART
+        int n = read(*fd, &tmp_byte, 1);
+        
+        if (n == 1) {
+            tmp_buff[readed++] = tmp_byte;
+        } else if (n < 0) {
+            break;
         }
     }
-    
+    tmp_buff[readed] = '\0';
+
+    if (strcmp(tmp_buff, startpkg) != 0) {  // if its not gonna be the start package we gonna close the MC FD and write log about that
+        close(*fd);
+        return 0;
+    }
+
     // first msg from MC equal the start package
 
-    init_apps(); // filling res ptr by info about which apps is working right now
-
-    while (1) {         // main cycle
-        if (init_apps()) {   // every second we checking the apps running
-            send_logos(fd, HOMEDIR);    // if some apps was chenged - we send pkgs to MC about it
-        }
-
-        sleep(1);   // delay on 1 sec
-        
-    }
+    Handler_for_processes(fd);
+    render_error("critical fault");
 }
 
 int main(void) {
-    const char* HOMEDIR = getenv("HOME");   // home dir for writing logs and 
-    int fd;                                      // main FD for MC
+    int fd = -1;                                  // main FD for MC
     char buff[64];                               // buffer for msgs from MC
 
-    if (!main_cycle_monitoring(&fd, buff, HOMEDIR)) {
-        write_log("problem with verification");
+    if (!main_cycle_monitoring(&fd, buff)) {
+        log_error("problem with verification");
         return 0;
     }
 
